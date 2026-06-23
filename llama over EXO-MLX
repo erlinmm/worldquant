@@ -1,0 +1,509 @@
+Thunderbolt 5 + Exo/MLX Distributed LLM Guide
+Target setup
+```text
+Mac Studio A: M3 Ultra, 256 GB unified memory
+Mac Studio B: M3 Ultra, 256 GB unified memory
+macOS: 26.4
+Connection: Thunderbolt 5 direct cable
+Goal: distributed language model inference with Apple RDMA over Thunderbolt
+Recommended stack: Exo + MLX + JACCL
+```
+---
+0. Important Summary
+For your goal:
+```text
+Mac A runs part of the model
+Mac B runs part of the model
+256 GB + 256 GB behaves like a larger model pool
+```
+there are two different paths:
+Goal	Best tool
+Run GGUF models split across two Macs	`llama.cpp RPC`
+Use Apple Thunderbolt RDMA on macOS	`Exo + MLX/JACCL`
+GGUF + Apple Thunderbolt RDMA + true model split	Not mature / not cleanly available today
+The key distinction:
+```text
+llama.cpp RPC:
+  Good for GGUF memory pooling
+  Usually TCP/RPC over Thunderbolt Bridge on macOS
+  Not confirmed native Apple RDMA
+
+Exo + MLX/JACCL:
+  Best path for Apple RDMA over Thunderbolt
+  Uses MLX distributed communication
+  Works with MLX/Hugging Face-style models, not GGUF-first
+```
+---
+1. Physical Connection
+Use a real Thunderbolt 5 cable, not a USB-C charging cable.
+For two Mac Studios:
+```text
+Mac A <==== Thunderbolt 5 cable ====> Mac B
+```
+A single direct cable is enough for two nodes.
+Mac Studio caveat: avoid the Thunderbolt 5 port next to the Ethernet port if Exo/MLX has issues. Use one of the other Thunderbolt 5 ports.
+---
+2. Enable Apple RDMA over Thunderbolt
+For MLX/JACCL and Exo, RDMA should be enabled from macOS Recovery.
+Do this on both Macs.
+Shut down the Mac.
+Hold the power button until startup options appear.
+Choose Options.
+Open Utilities → Terminal.
+Run:
+```bash
+rdma_ctl enable
+```
+Reboot.
+After reboot, test:
+```bash
+ibv_devices
+```
+Expected style of output:
+```text
+device      node GUID
+------      ----------------
+rdma_en2    ...
+rdma_en3    ...
+rdma_en4    ...
+rdma_en5    ...
+```
+If you see `rdma_en*` devices, Apple RDMA over Thunderbolt is enabled.
+---
+3. Do Not Treat Thunderbolt Bridge as RDMA
+For `llama.cpp RPC`, you often configure:
+```text
+Thunderbolt Bridge
+192.168.50.1
+192.168.50.2
+```
+That is useful for TCP/RPC.
+For MLX/JACCL RDMA, TCP/IP is not the actual communication path. MLX/JACCL uses the RDMA interfaces directly, so Thunderbolt Bridge may need to be disabled or isolated depending on the configuration script.
+So:
+```text
+Thunderbolt Bridge fast IP link ≠ proof of RDMA
+```
+---
+4. Easiest Route: Exo macOS App
+On both Macs:
+```bash
+brew install --cask exo
+```
+Launch Exo on both machines.
+Exo may ask for permission to:
+```text
+modify system network settings
+install a network profile
+configure RDMA-related interfaces
+```
+Allow it if you want the automated RDMA setup.
+Then open on either Mac:
+```text
+http://localhost:52415
+```
+Look for:
+```text
+2 nodes discovered
+both M3 Ultra machines visible
+JACCL / RDMA / tensor placement available
+```
+Good signs:
+```text
+MlxJaccl
+JACCL
+RDMA
+Tensor
+rdma_en*
+```
+Less ideal signs:
+```text
+MlxRing
+Ring
+TCP
+only one node
+```
+`MlxRing` can still work, but it is not the RDMA/JACCL path you want.
+---
+5. More Controllable Route: Run Exo from Source
+Use this route if you want logs and debugging.
+5.1 Install dependencies
+On both Macs:
+```bash
+xcode-select --install
+brew install uv node git
+```
+Install Rust nightly:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup toolchain install nightly
+```
+Restart your shell, or run:
+```bash
+source "$HOME/.cargo/env"
+```
+5.2 Clone Exo
+On both Macs:
+```bash
+git clone https://github.com/exo-explore/exo
+cd exo
+```
+5.3 Build the dashboard
+```bash
+cd dashboard
+npm install
+npm run build
+cd ..
+```
+5.4 Configure RDMA network
+From the Exo repo:
+```bash
+sudo tmp/set_rdma_network_config.sh
+```
+This script is intended to prepare the Thunderbolt/RDMA networking setup used by Exo.
+5.5 Run Exo on both Macs
+Use the same namespace on both machines:
+```bash
+EXO_LIBP2P_NAMESPACE=m3u-rdma-cluster \
+EXO_TRACING_ENABLED=true \
+uv run exo
+```
+Then open:
+```text
+http://localhost:52415
+```
+---
+6. Test with a Small Model First
+Do not begin with a 200B+ model. First prove that the cluster works.
+Example small MLX model:
+```text
+mlx-community/Llama-3.2-1B-Instruct-4bit
+```
+Preview possible placements:
+```bash
+curl "http://localhost:52415/instance/previews?model_id=mlx-community/Llama-3.2-1B-Instruct-4bit"
+```
+You want to see a placement involving:
+```text
+2 nodes
+tensor sharding
+JACCL / RDMA
+```
+Then test chat:
+```bash
+curl -N -X POST http://localhost:52415/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Explain Apple RDMA over Thunderbolt in one paragraph."
+      }
+    ],
+    "stream": true
+  }'
+```
+---
+7. Try a Large MLX Model
+For your 256 GB + 256 GB setup, a better test is a model that is too large or uncomfortable for one Mac.
+Example:
+```text
+mlx-community/Qwen3-235B-A22B-8bit
+```
+Add it if needed:
+```bash
+curl -X POST http://localhost:52415/models/add \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_id": "mlx-community/Qwen3-235B-A22B-8bit"
+  }'
+```
+Preview placements:
+```bash
+curl "http://localhost:52415/instance/previews?model_id=mlx-community/Qwen3-235B-A22B-8bit"
+```
+Look for a two-node tensor/JACCL placement.
+Then request inference through the Exo OpenAI-compatible API:
+```bash
+curl -N -X POST http://localhost:52415/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "mlx-community/Qwen3-235B-A22B-8bit",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Give a concise explanation of mixture-of-experts models."
+      }
+    ],
+    "temperature": 0.2,
+    "stream": true
+  }'
+```
+---
+8. Benchmark RDMA/JACCL vs Ring/TCP
+Exo includes a benchmark script.
+Example:
+```bash
+uv run bench/exo_bench.py \
+  --model Llama-3.2-1B-Instruct-4bit \
+  --pp 128,512 \
+  --tg 128 \
+  --max-nodes 2 \
+  --sharding tensor \
+  --instance-meta jaccl \
+  --repeat 3 \
+  --json-out m3u-rdma-results.json
+```
+Important metrics:
+```text
+prompt processing tokens/sec
+generation tokens/sec
+time to first token
+peak memory per node
+whether both nodes are used
+```
+Compare:
+```text
+MlxRing / ring / TCP
+vs
+MlxJaccl / jaccl / RDMA
+```
+If JACCL is working correctly, the RDMA path should reduce inter-node overhead.
+---
+9. Lower-Level MLX/JACCL Route
+Use this if you want to bypass Exo and test MLX distributed directly.
+9.1 Install MLX and MLX-LM
+On both Macs:
+```bash
+python3 -m venv ~/mlx-rdma
+source ~/mlx-rdma/bin/activate
+pip install -U mlx mlx-lm
+```
+9.2 Make sure SSH works
+From Mac A:
+```bash
+ssh mac-b.local hostname
+```
+If needed, enable:
+```text
+System Settings → General → Sharing → Remote Login
+```
+on Mac B.
+9.3 Generate MLX distributed config
+From Mac A:
+```bash
+mlx.distributed_config --verbose \
+  --hosts mac-a.local,mac-b.local \
+  --over thunderbolt \
+  --backend jaccl \
+  --auto-setup \
+  --output m3u2-jaccl.json
+```
+9.4 Launch distributed MLX-LM
+```bash
+mlx.launch --verbose \
+  --backend jaccl \
+  --hostfile m3u2-jaccl.json \
+  --env MLX_METAL_FAST_SYNCH=1 \
+  -- \
+  python -m mlx_lm chat \
+  --model mlx-community/Llama-3.2-1B-Instruct-4bit
+```
+For a larger test:
+```bash
+mlx.launch --verbose \
+  --backend jaccl \
+  --hostfile m3u2-jaccl.json \
+  --env MLX_METAL_FAST_SYNCH=1 \
+  -- \
+  python -m mlx_lm chat \
+  --model mlx-community/Qwen3-235B-A22B-8bit
+```
+---
+10. How to Know RDMA Is Really Being Used
+Good signs
+```bash
+ibv_devices
+```
+shows:
+```text
+rdma_en2
+rdma_en3
+rdma_en4
+...
+```
+Exo or MLX logs mention:
+```text
+JACCL
+RDMA
+rdma_en*
+tensor
+MlxJaccl
+```
+Both Macs show:
+```text
+high memory use
+GPU activity
+model shards / placement on both nodes
+```
+Bad signs
+```text
+only one Mac is used
+placement says Ring/TCP only
+no rdma_en* devices
+Thunderbolt Bridge IP works but JACCL unavailable
+```
+Remember:
+```text
+ping works ≠ RDMA works
+iperf3 works ≠ RDMA works
+```
+`ping` and `iperf3` test IP/TCP networking. JACCL/RDMA is lower-level.
+---
+11. Where llama.cpp Fits
+For GGUF:
+```text
+llama.cpp RPC is still the best practical distributed option
+```
+Example:
+Mac B
+```bash
+cd ~/llama.cpp
+
+GGML_RPC_DEBUG=1 ./build/bin/rpc-server \
+  -H 192.168.50.2 \
+  -p 50052 \
+  -c
+```
+Mac A
+```bash
+cd ~/llama.cpp
+
+GGML_RPC_DEBUG=1 ./build/bin/llama-server \
+  -m /Users/xin/models/large-model.gguf \
+  --rpc 192.168.50.2:50052 \
+  -ngl all \
+  --split-mode layer \
+  --tensor-split 1,1 \
+  -c 8192 \
+  --host 127.0.0.1 \
+  --port 8080
+```
+This can split a GGUF model across both Macs.
+But for macOS:
+```text
+llama.cpp RPC over Thunderbolt: yes
+Apple RDMA inside llama.cpp: not confirmed / likely not
+```
+---
+12. Performance Expectations
+Best case for Exo/MLX/JACCL
+```text
+Large MLX model
+tensor sharding
+two M3 Ultra nodes
+Thunderbolt 5 RDMA working
+```
+Expected benefit:
+```text
+larger model capacity
+better inter-node latency than TCP
+better scaling than llama.cpp RPC in many distributed cases
+```
+Best case for llama.cpp RPC
+```text
+Large GGUF model
+one Mac cannot fit it
+two Macs can fit it
+```
+Expected benefit:
+```text
+model runs at all
+memory pooling works
+speed may be lower than single Mac for models that already fit
+```
+Avoid using two nodes for small models
+For models like:
+```text
+7B
+13B
+30B
+70B quantized
+```
+one M3 Ultra may be faster because there is no inter-node communication overhead.
+Use two nodes mainly for:
+```text
+100B+
+200B+
+models that exceed one 256 GB machine
+very long context workloads
+```
+---
+13. Recommended Workflow for Your Hardware
+```text
+1. Enable RDMA in Recovery on both Macs with rdma_ctl enable.
+2. Verify ibv_devices shows rdma_en*.
+3. Install Exo app first.
+4. Confirm both Macs appear in the Exo dashboard.
+5. Confirm JACCL/RDMA/tensor placement exists.
+6. Test with Llama-3.2-1B-Instruct-4bit.
+7. Benchmark ring vs jaccl.
+8. Move to Qwen3-235B-A22B-8bit or similar large MLX model.
+9. Use llama.cpp RPC only when you specifically need GGUF.
+```
+---
+14. Troubleshooting
+`ibv_devices` shows nothing
+Run RDMA enable again from Recovery:
+```bash
+rdma_ctl enable
+```
+Then reboot.
+Exo sees only one Mac
+Check both Macs are running Exo with the same namespace:
+```bash
+EXO_LIBP2P_NAMESPACE=m3u-rdma-cluster uv run exo
+```
+Also check macOS firewall and local network permissions.
+Placement shows Ring instead of JACCL
+This usually means MLX/Exo did not find the RDMA path.
+Check:
+```bash
+ibv_devices
+```
+and rerun the Exo RDMA network script:
+```bash
+sudo tmp/set_rdma_network_config.sh
+```
+Small model is slower on two Macs
+That is normal. Use one Mac for small models.
+Huge model loads but generation is slow
+Try:
+```text
+lower context length
+different sharding placement
+JACCL instead of Ring
+fewer concurrent requests
+larger model with MoE active-parameter efficiency
+```
+---
+15. Reference Links
+Apple MLX distributed guide: https://ml-explore.github.io/mlx/build/html/usage/distributed.html
+Exo GitHub: https://github.com/exo-explore/exo
+Exo website: https://exolabs.net/
+llama.cpp RPC README: https://github.com/ggml-org/llama.cpp/blob/master/tools/rpc/README.md
+llama.cpp multi-GPU docs: https://github.com/ggml-org/llama.cpp/blob/master/docs/multi-gpu.md
+MLX community models: https://huggingface.co/mlx-community
+---
+Final Recommendation
+For your two M3 Ultra 256 GB Mac Studios:
+```text
+If you want GGUF:
+  use llama.cpp RPC over Thunderbolt
+
+If you want Apple Thunderbolt RDMA:
+  use Exo + MLX/JACCL
+
+If you want the best chance of real distributed speedup:
+  use Exo + MLX/JACCL with a large MLX model
+```
